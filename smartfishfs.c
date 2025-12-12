@@ -1,73 +1,100 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/fs.h>       // 核心：文件系统相关的头文件
+#include <linux/fs.h>
+#include <linux/pagemap.h> /* 为了使用 PAGE_SIZE 等宏 */
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Smartfish Developer");
 MODULE_DESCRIPTION("A simple in-memory file system: smartfishfs");
-MODULE_VERSION("0.2");
+MODULE_VERSION("0.3");
 
-// --- 前向声明 ---
-// 这是 mount_nodev 需要的回调函数。
-// 目前我们先让它返回 0 (成功)，但不做任何实际初始化。
-// 到了 Phase 3 我们会在这里填充根目录。
+#define SMARTFISH_MAGIC 0x1314520 /* 定义一个魔数，如同文件系统的指纹 */
+
+// --- 超级块操作 ---
+// 当用户使用 'df' 命令查看磁盘空间时，会回调这个函数
+static const struct super_operations smartfishfs_ops = {
+    .statfs = simple_statfs, // 使用内核通用的统计函数
+    .drop_inode = generic_delete_inode,
+};
+
+// --- 初始化超级块 ---
+// 这是 mount 过程的核心：创建根目录的 inode 和 dentry
 static int smartfishfs_fill_super(struct super_block *sb, void *data, int silent)
 {
-    pr_info("smartfishfs: mounting... (fill_super called)\n");
+    struct inode *inode;
+
+    // 1. 设置超级块基本属性
+    sb->s_blocksize = PAGE_SIZE;     // 规定：咱们仓库货架最小格子是 4KB
+    sb->s_blocksize_bits = PAGE_SHIFT;  
+    sb->s_magic = SMARTFISH_MAGIC;  // 挂牌：门口挂上“SmartFish”的招牌，别让人以为是 NTFS
+    sb->s_op = &smartfishfs_ops;    // 客服手册：遇到大事（比如仓库要拆迁）该找谁处理
+    sb->s_time_gran = 1;
+
+    // 2. 创建根目录的 inode
+    // new_inode 是内核提供的函数，从内存中分配一个 inode
+    inode = new_inode(sb);
+    if (!inode)
+        return -ENOMEM;
+
+    // 3. 设置根 inode 的属性
+    inode->i_ino = 1; // 根目录 inode 号通常为 1 或 2
+    inode->i_mode = S_IFDIR | 0755; // S_IFDIR 表示它是目录，0755 是权限
+    // 设置时间戳为当前时间
+    inode_set_mtime_to_ts(inode, inode_set_atime_to_ts(inode, inode_set_ctime_to_ts(inode, current_time(inode))));
+    
+    // 关键：为了让目录能工作，我们暂时借用内核自带的 simple_dir 操作
+    // 这样我们就能 ls 这个目录，虽然它现在是空的
+    inode->i_op = &simple_dir_inode_operations;
+    inode->i_fop = &simple_dir_operations;
+    
+    // 目录的链接数通常是 2 (. 和 ..)
+    set_nlink(inode, 2);
+
+    // 4. 创建根 dentry 并与 inode 关联
+    // d_make_root 会将 inode 封装成 dentry，如果失败会自动释放 inode
+    sb->s_root = d_make_root(inode);
+    if (!sb->s_root) {
+        return -ENOMEM;
+    }
+
+    pr_info("smartfishfs: superblock initialized, root created!\n");
     return 0;
 }
 
-// --- 接口实现 ---
-
-// 1. 挂载入口
-// 当用户执行 mount -t smartfishfs 时，内核调用此函数
+// --- 挂载入口 ---
 static struct dentry *smartfishfs_mount(struct file_system_type *fs_type,
                                         int flags, const char *dev_name, void *data)
 {
-    // mount_nodev 是内核提供的辅助函数，用于创建无物理设备的超级块
-    // 它会创建一个超级块，然后调用 smartfishfs_fill_super 来初始化它
+    // 调用 mount_nodev，传入我们写好的 fill_super
     return mount_nodev(fs_type, flags, data, smartfishfs_fill_super);
 }
 
-// 2. 定义文件系统类型结构体
-// 这是文件系统的"身份证"
+// --- 驱动结构体 ---
 static struct file_system_type smartfishfs_type = {
     .owner = THIS_MODULE,
-    .name = "smartfishfs",        // 关键：mount命令用的名字
-    .mount = smartfishfs_mount,   // 挂载时执行的方法
-    .kill_sb = kill_litter_super, // 卸载时清理内存的标准方法 (用于无设备FS)
-    .fs_flags = FS_USERNS_MOUNT,  // 允许在用户命名空间挂载 (可选，增加兼容性)
+    .name = "smartfishfs",
+    .mount = smartfishfs_mount,
+    .kill_sb = kill_litter_super,
+    .fs_flags = FS_USERNS_MOUNT,
 };
 
-// --- 模块生命周期 ---
-
+// --- 模块生命周期 (不变) ---
 static int __init smartfishfs_init(void)
 {
-    int ret;
-
-    // 向内核注册我们的文件系统
-    ret = register_filesystem(&smartfishfs_type);
+    int ret = register_filesystem(&smartfishfs_type);
     if (ret) {
-        pr_err("smartfishfs: failed to register filesystem\n");
+        pr_err("smartfishfs: register failed\n");
         return ret;
     }
-
-    pr_info("smartfishfs: registered successfully!\n");
+    pr_info("smartfishfs: registered!\n");
     return 0;
 }
 
 static void __exit smartfishfs_exit(void)
 {
-    int ret;
-
-    // 从内核注销
-    ret = unregister_filesystem(&smartfishfs_type);
-    if (ret) {
-        pr_err("smartfishfs: failed to unregister filesystem\n");
-    }
-
-    pr_info("smartfishfs: unregistered successfully!\n");
+    unregister_filesystem(&smartfishfs_type);
+    pr_info("smartfishfs: unregistered!\n");
 }
 
 module_init(smartfishfs_init);
